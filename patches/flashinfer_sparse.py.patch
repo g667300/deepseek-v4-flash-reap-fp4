@@ -1,0 +1,100 @@
+--- a/vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py
++++ b/vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py
+@@ -1,5 +1,19 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++#
++# MODIFIED for the noooop/DeepSeek-V4-Flash-REAP-FP4 model repository. This is
++# not the upstream vLLM file. Base: vLLM 0.25.1, vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py.
++# Changes (54 added / 3 removed functional lines, plus this notice;
++# flashinfer_sparse.py.patch is the exact diff against that base):
++#   * `_as_sparse_cache()` re-views an oversized sparse-SWA page as 64-token
++#     pages, keeping the FlashInfer DSv4 decode kernel dispatchable on
++#     SM120/SM121, guarded by multiple-of-64 and stride checks;
++#   * `_pad_decode_sparse_indices()` pads decode top-k to an instantiated
++#     kernel width with FlashInfer's -1 invalid-slot sentinel;
++#   * one decode call site uses both.
++# The page re-view is derived from anemll/dspark-vllm-gx10 (MIT); the inline
++# attribution at its use site is part of that derivation.
++#
+ """DeepSeek V4 FlashInfer sparse MLA backend."""
+ 
+ from typing import TYPE_CHECKING, ClassVar, cast
+@@ -30,6 +44,7 @@
+     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
+ 
+ _FLASHINFER_DSV4_WORKSPACE_BUFFER_SIZE = 128 * 1024 * 1024
++_FLASHINFER_DSV4_DECODE_TOPKS = (128, 512, 1024)
+ _flashinfer_dsv4_workspace_by_device: dict[torch.device, torch.Tensor] = {}
+ 
+ 
+@@ -539,9 +554,58 @@
+     def _as_sparse_cache(kv_cache: torch.Tensor) -> torch.Tensor:
+         if kv_cache.dtype == torch.float8_e4m3fn:
+             kv_cache = kv_cache.view(torch.uint8)
+-        if kv_cache.dim() == 4:
+-            return kv_cache
+-        return kv_cache.unsqueeze(-2)
++        if kv_cache.dim() != 4:
++            kv_cache = kv_cache.unsqueeze(-2)
++
++        # vLLM exposes a 256-token allocation page for the SWA segment (the V4
++        # indexer requires it) while FlashInfer's SM120/SM121 DSv4 decode kernel
++        # is instantiated only for 64-token pages. At 256 the decode kernel is
++        # not dispatchable, the call falls through to the prefill orchestrator,
++        # and its "num_tokens > 64" assert is one speculative verification can
++        # never satisfy. Slots are physically contiguous and the indices are
++        # flattened slot ids, so an oversized page can be re-viewed as 64-token
++        # pages at zero copy.
++        # Taken from anemll/dspark-vllm-gx10 (MIT), overlay/vllm/models/
++        # deepseek_v4/nvidia/flashinfer_sparse.py.
++        if (
++            kv_cache.dtype == torch.uint8
++            and kv_cache.shape[-1] == 584
++            and kv_cache.shape[-3] > 64
++        ):
++            page_size = kv_cache.shape[-3]
++            if page_size % 64 != 0:
++                raise ValueError(
++                    "Packed SM120 DSv4 KV page size must be a multiple of 64, "
++                    f"got {page_size}."
++                )
++            expected_strides = (page_size * 584, 584, 584, 1)
++            if kv_cache.stride() != expected_strides:
++                raise ValueError(
++                    "Packed SM120 DSv4 KV cache cannot be split into zero-copy "
++                    f"64-token pages: shape={tuple(kv_cache.shape)}, "
++                    f"strides={kv_cache.stride()}, expected={expected_strides}."
++                )
++            kv_cache = kv_cache.view(-1, 64, 1, 584)
++        return kv_cache
++
++    @staticmethod
++    def _pad_decode_sparse_indices(indices: torch.Tensor) -> torch.Tensor:
++        """Pad DSpark's non-causal top-k to a native SM120 kernel width."""
++        topk = indices.shape[-1]
++        if topk in _FLASHINFER_DSV4_DECODE_TOPKS:
++            return indices
++        for supported_topk in _FLASHINFER_DSV4_DECODE_TOPKS:
++            if topk < supported_topk:
++                # -1 is FlashInfer's documented invalid-slot sentinel. The
++                # per-token top-k lengths are unchanged, so padded entries
++                # cannot contribute to attention.
++                return torch.nn.functional.pad(
++                    indices, (0, supported_topk - topk), value=-1
++                )
++        raise ValueError(
++            "SM120 DSv4 sparse decode supports at most 1024 SWA indices, "
++            f"got {topk}."
++        )
+ 
+     @classmethod
+     def get_padded_num_q_heads(cls, num_heads: int) -> int:
+@@ -759,6 +823,7 @@
+         swa_lens = swa_metadata.decode_swa_lens
+         assert swa_indices is not None
+         assert swa_lens is not None
++        swa_indices = self._pad_decode_sparse_indices(swa_indices)
+         q = self._prepare_query(q, output)
+         swa_cache = self._as_sparse_cache(self.swa_cache_layer.kv_cache)
+         extra_cache = self._as_sparse_cache(kv_cache) if kv_cache is not None else None

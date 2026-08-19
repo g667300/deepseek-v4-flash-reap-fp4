@@ -1,0 +1,35 @@
+{
+  "_comment": [
+    "Example calibration profile for general German and English text.",
+    "It is a starting point, not a claim that 50/50 is optimal for every workload.",
+    "The source names de-wiki and en-wiki are the keys used by remix_saliency.py."
+  ],
+  "chat_template_kwargs": { "thinking_mode": "chat" },
+  "seq_len": 2048,
+  "num_samples": 512,
+  "seed": 0,
+  "sources": [
+    {
+      "name": "de-wiki",
+      "lang": "de",
+      "weight": 0.5,
+      "dataset": "wikimedia/wikipedia",
+      "config": "20231101.de",
+      "split": "train",
+      "format": "text",
+      "field": "text",
+      "shuffle_buffer": 2000
+    },
+    {
+      "name": "en-wiki",
+      "lang": "en",
+      "weight": 0.5,
+      "dataset": "wikimedia/wikipedia",
+      "config": "20231101.en",
+      "split": "train",
+      "format": "text",
+      "field": "text",
+      "shuffle_buffer": 2000
+    }
+  ]
+}
