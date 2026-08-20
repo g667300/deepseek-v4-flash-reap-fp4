@@ -2,17 +2,21 @@
 
 Everything used to produce and check the published builds, so a third party
 can rebuild them, build a different one, or re-run the numbers in
-[the published quality documentation](https://huggingface.co/noooop/DeepSeek-V4-Flash-REAP128-FP4/blob/main/docs/QUALITY.md) instead of taking
-them on trust.
+[`../docs/QUALITY.md`](../docs/QUALITY.md) instead of taking them on trust.
+
+**This is a snapshot.** The canonical copy of these scripts, with its history,
+is [`g667300/deepseek-v4-flash-reap-fp4`](https://github.com/g667300/deepseek-v4-flash-reap-fp4) on GitHub; they are shipped with
+the weights so a download is self-contained.
 
 These are the working scripts, published as they were run. They are MIT licensed
-(see [`../LICENSE`](../LICENSE)), carry no support promise, and their defaults
-name the author's own paths (`models/…`, `artifacts/…`) — pass the paths
+(see [`../LICENSE-CODE`](../LICENSE-CODE)), carry no support promise, and their
+defaults name the author's own paths (`models/…`, `artifacts/…`) — pass the paths
 explicitly rather than relying on a default.
 
-Nothing here needs anything outside this repository, with one documented
-exception: `eval_code_challenge.py` drives the official LiveCodeBench and
-BigCodeBench evaluators, which you supply with `--lcb-root` and `--bcb-root`.
+Nothing here needs a checkout of the private development repository, with one
+documented exception: the two `eval_code_challenge.py` suites drive the official
+LiveCodeBench and BigCodeBench evaluators, which you supply with `--lcb-root`
+and `--bcb-root`.
 
 ## There are two ways to build a checkpoint, and they agree
 
@@ -64,14 +68,13 @@ Version-sensitive, and not incidentally:
 
 ## 0. Calibration input
 
-`calib.pt` is not distributed — [the calibration documentation](https://huggingface.co/noooop/DeepSeek-V4-Flash-REAP128-FP4/blob/main/calibration/README.md)
-says why, and lists the licences of the sources. Rebuild it from the mixture in
-[`../calib/`](../calib):
+`calib.pt` is not distributed — see [`../calibration/README.md`](../calibration/README.md)
+for why, and for the licences of the sources. Rebuild it from the shipped mixture:
 
 ```bash
-python scripts/build_calibration.py --mix calib/mix-dsv4.json \
+python scripts/build_calibration.py --mix calibration/mix-dsv4.json \
     --tokenizer /path/to/DeepSeek-V4-Flash-0731 --out calib.pt
-python scripts/build_calibration.py --mix calib/mix-dsv4.json \
+python scripts/build_calibration.py --mix calibration/mix-dsv4.json \
     --tokenizer /path/to/DeepSeek-V4-Flash-0731 --probe   # reachability only
 ```
 
@@ -82,13 +85,13 @@ renders the instruction and chat sources through the checkpoint's own
 
 The mixture pins 512 samples × 2048 tokens and seed 0, but not immutable dataset
 revisions, so a later upstream dataset edit can legitimately change the digest in
-`calib.pt.sha256`, published with the models. Treat a mismatch as a different calibration run.
+`calibration/calib.pt.sha256`. Treat a mismatch as a different calibration run.
 
 `label_calibration.py` reconstructs which source each 2048-token sample came
 from, which is what makes a *per-source* saliency run possible:
 
 ```bash
-python scripts/label_calibration.py --mix calib/mix-dsv4.json \
+python scripts/label_calibration.py --mix calibration/mix-dsv4.json \
     --tokens calib.pt --out calib-sources.json
 ```
 
@@ -111,7 +114,7 @@ python scripts/quantize_to_deepseek.py \
 # 4. carry the three MTP blocks across, pruned to match
 python scripts/carry_mtp.py \
     --src /path/to/DeepSeek-V4-Flash-0731 --dst dsv4-reap50 \
-    --score saliency --saliency mtp-saliency.json
+    --score saliency --saliency calibration/mtp-saliency.json
 ```
 
 Measured on this checkpoint: step 2 61 min, step 3 28 min with 3 workers, step 4
@@ -143,12 +146,12 @@ Four things about this path that are easy to get wrong:
 ```bash
 # any expert count, from the published saliency
 python scripts/build_pruned.py --reference /path/to/DeepSeek-V4-Flash-0731 \
-    --saliency target-saliency.json --experts 152 --out dsv4-reap152
+    --saliency calibration/target-saliency.json --experts 152 --out dsv4-reap152
 # or from an exact recorded selection
 python scripts/build_pruned.py --reference /path/to/DeepSeek-V4-Flash-0731 \
-    --retained reap128-retained-sets.json --out dsv4-reap128
+    --retained calibration/reap128-retained-sets.json --out dsv4-reap128
 python scripts/carry_mtp.py --src /path/to/DeepSeek-V4-Flash-0731 \
-    --dst dsv4-reap152 --score saliency --saliency mtp-saliency.json
+    --dst dsv4-reap152 --score saliency --saliency calibration/mtp-saliency.json
 ```
 
 `remix_saliency.py` reweights a **source-split** saliency file into a retained
@@ -248,6 +251,18 @@ Four traps, each of which cost a run:
 * **Check convergence with an even/odd split of the capture** before building.
   At 3,930 routed tokens per block the top-128 set reproduced itself only 82-84%
   across the split; at 19,970 it reached 87-94% (`sum_saliency` 94-97%).
+* **Capture with the head unpruned** (`MOE_CAPTURE_EXPERTS=256`, built by
+  `carry_mtp.py --experts 256`). Capturing a 128-expert head only measures the
+  128 already chosen; the selection cannot be redone from it.
+* **A larger target may not fit at 0.85.** A 152-expert target with the 256-expert
+  head loads 100.37 GiB and leaves *negative* KV room there. What worked was 0.87
+  with `--max-num-seqs 2 --max-num-batched-tokens 2048 --max-model-len 2048`,
+  which yielded 1.71 GiB of cache — the batch settings do more than the
+  utilization does, and 0.9 is the line that hangs this host.
+* **Never delete the capture directory while the server runs.** The probe does not
+  recreate it: every save then fails with `Parent directory … does not exist`,
+  the run records 12,000 router calls and writes nothing, and the engine stops
+  answering. Clear the *files* and keep the directory.
 
 `mean` is the default because REAP itself selects on `mean_saliency`;
 `--saliency-key sum_saliency` is kept because the two disagree here (sharing
@@ -265,7 +280,7 @@ bias-ordered and the same six experts win every time.
 `serve_patched.sh` is the recipe that produced the speculative numbers, written
 for the author's two-machine layout (it rsyncs to a Spark and mounts the
 overlays from `artifacts/patches/`). Read it as a recipe; the canonical launch
-commands are in [the serving documentation](https://huggingface.co/noooop/DeepSeek-V4-Flash-REAP128-FP4/blob/main/docs/SERVING.md), and the overlays
+commands are in [`../docs/SERVING.md`](../docs/SERVING.md), and the overlays
 themselves in [`../patches/`](../patches).
 
 ```bash
@@ -279,7 +294,7 @@ short prompts is noise.
 
 ## Reproducing the published evaluations
 
-Every number in [the quality documentation](https://huggingface.co/noooop/DeepSeek-V4-Flash-REAP128-FP4/blob/main/docs/QUALITY.md) comes from these,
+Every number in [`../docs/QUALITY.md`](../docs/QUALITY.md) comes from these,
 against a running OpenAI-compatible server:
 
 ```bash
@@ -291,7 +306,7 @@ python scripts/eval_generative.py --url http://HOST:8000/v1 --model dsv4 \
     --limit 200
 
 # held-out perplexity: build the holdout first, with THIS tokenizer
-python scripts/build_calibration.py --mix calib/ppl-holdout-dsv4.json \
+python scripts/build_calibration.py --mix calibration/ppl-holdout-dsv4.json \
     --tokenizer /path/to/DeepSeek-V4-Flash-0731 --out ppl-holdout.pt
 python scripts/eval_perplexity.py --data ppl-holdout.pt \
     --base-url http://HOST:8000/v1 --model dsv4 --out ppl.json
@@ -310,8 +325,16 @@ MODEL=dsv4 TOKENIZER=/path/to/DeepSeek-V4-Flash-0731 TAG=mine \
 
 Notes that decide whether your numbers are comparable:
 
+* **discard the first run after a server load.** On vLLM it is **1.66-1.80x
+  slower** than steady state — measured on three checkpoints — while the
+  speculative counters come out bit-identical, because greedy decoding fixes the
+  tokens and only wall-clock time moves. llama.cpp shows a 1.04x version of the
+  same effect. A cold vLLM number next to a warm llama.cpp one distorts the
+  comparison by more than the difference being measured, and this repository
+  published exactly that mistake once.
+
 * **the perplexity holdout must be built with this model's tokenizer.** It is
-  token IDs, and the mixture (`calib/ppl-holdout-dsv4.json`, seed 999, 128
+  token IDs, and the mixture (`calibration/ppl-holdout-dsv4.json`, seed 999, 128
   samples) is disjoint from the calibration set by seed only. A holdout from
   another model showed up as a bare HTTP 400 several stages into a run.
 * `eval_generative.py` scores by **generation**, not log-likelihood, so that a
